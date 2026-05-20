@@ -21,8 +21,12 @@ Benchmarking on flash attention in prefilling time and paged attention in decodi
 # Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Sync dependencies
-uv sync
+# Create project env
+uv venv
+source .venv/bin/activate
+
+# Install project deps: pulls torch packages from the configured XPU index
+uv sync --extra xpu --inexact
 
 # Run the main inference engine
 uv run python main.py
@@ -35,6 +39,24 @@ uv run python benchmark_decoding.py
 ```
 
 To run multi-GPU setting, simply change world_size to n > 1 in config in main.py
+
+## Intel XPU Quickstart
+
+This project targets `torch.xpu` for the main inference path.
+
+```bash
+# Create / activate your env first
+uv venv
+source .venv/bin/activate
+
+# Install project deps with the XPU extra
+uv sync --extra xpu --inexact
+
+# Run on XPU explicitly
+MINIVLLM_DEVICE=xpu uv run --extra xpu --no-sync python main.py
+```
+
+For multi-XPU distributed runs, install oneCCL bindings separately and set `MINIVLLM_DIST_BACKEND=ccl`. Single-XPU runs do not need oneCCL.
 
 ## What Each Script Does
 
@@ -59,11 +81,7 @@ uv run python benchmark_prefilling.py
 
 This is the pefilling phase comparison
 
-Compares three attention implementations during the **prefilling phase** (processing input prompts):
-
-1. **PyTorch Standard (O(N²) memory)**: Traditional attention that materializes full attention matrix
-2. **Naive Triton (O(N²) memory)**: GPU kernel that also uses O(N²) memory, limited by shared memory constraints (≤128 tokens)
-3. **Flash Attention (O(N) memory)**: Memory-efficient online softmax algorithm that processes attention in blocks
+Compares the prefill implementations used by the project on the PyTorch path.
 
 ```bash
 uv run python benchmark_decoding.py
@@ -71,11 +89,7 @@ uv run python benchmark_decoding.py
 
 This is the decoding phase comparison
 
-Compares three implementations during the **decoding phase** (generating output tokens one at a time):
-
-1. **Naive PyTorch**: Simple loop-based implementation using paged KV cache
-2. **Optimized PyTorch**: Vectorized implementation with batch gathering and masking
-3. **Triton Kernel**: Custom GPU kernel optimized for paged attention decode
+Compares the decoding implementations used by the project on the PyTorch path.
 
 
 ## Project Structure
@@ -97,8 +111,9 @@ myvllm/
 ## Requirements
 
 - Python ≥3.11, < 3.12
-- CUDA-capable GPU
-- Dependencies: `transformers`, `torch`, `xxhash` (managed by uv)
+- Main engine: `transformers`, `xxhash`
+- Backend runtime: install `torch` through the `xpu` extra
+- Intel XPU requires an Intel GPU plus the configured PyTorch XPU wheel index
 
 
 ## Star History

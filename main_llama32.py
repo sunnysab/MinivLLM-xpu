@@ -12,6 +12,8 @@ from myvllm.engine.llm_engine import LLMEngine as LLM
 from myvllm.sampling_parameters import SamplingParams
 
 config = {
+    'device': os.environ.get('MINIVLLM_DEVICE'),
+    'dist_backend': os.environ.get('MINIVLLM_DIST_BACKEND'),
     'max_num_sequences': 16,
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,

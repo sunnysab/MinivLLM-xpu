@@ -13,12 +13,16 @@ from myvllm.engine.llm_engine import LLMEngine as LLM
 from myvllm.sampling_parameters import SamplingParams
 
 config = {
+    'device': os.environ.get('MINIVLLM_DEVICE'),
+    'dist_backend': os.environ.get('MINIVLLM_DIST_BACKEND'),
     'max_num_sequences': 16,
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
     'block_size': 256,
     'world_size': 1,
-    'model_name_or_path': 'Qwen/Qwen3-0.6B',
+    'model_name_or_path': '/mnt/data/ai-models/qwen3-0.6b',
+    'model_type': 'Qwen3-0.6B',
+    'local_files_only': True,
     'enforce_eager': True,
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
     'hidden_size': 1024,
@@ -41,9 +45,11 @@ config = {
 }
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    model_name = config.get('model_name_or_path', 'Qwen/Qwen3-0.6B')
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)
+    model_name = os.path.expanduser(config['model_name_or_path'])
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        local_files_only=config.get('local_files_only', False),
+    )
     llm = LLM(config=config)
     
     # max_tokens is the max number of generated tokens
@@ -52,8 +58,8 @@ def main():
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
     prompts = [
         "introduce yourself",# * 15,
-        "list all prime numbers within 100",# * 15,
-        "give me your opinion on the impact of artificial intelligence on society",# * 15,
+        # "list all prime numbers within 100",# * 15,
+        # "give me your opinion on the impact of artificial intelligence on society",# * 15,
     ] #* 30
     prompts = [
         tokenizer.apply_chat_template(

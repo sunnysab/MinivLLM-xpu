@@ -7,6 +7,14 @@ setup(
     packages=find_packages(where="src"),
     python_requires="==3.11.14",
     install_requires=[
-        "torch",
+        "transformers",
+        "xxhash",
     ],
+    extras_require={
+        "xpu": [
+            "torch==2.11.0+xpu",
+            "torchvision==0.26.0+xpu",
+            "torchaudio==2.11.0+xpu",
+        ],
+    },
 )

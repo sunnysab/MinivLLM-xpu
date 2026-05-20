@@ -1,4 +1,5 @@
 from myvllm.layers import *
+from myvllm.utils.device import get_tp_world_size
 
 from typing import Tuple
 
@@ -19,7 +20,7 @@ class LlamaAttn(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        self.tp_size = dist.get_world_size()
+        self.tp_size = get_tp_world_size()
 
         self.total_num_heads = num_qo_heads
         self.num_heads = num_qo_heads // self.tp_size

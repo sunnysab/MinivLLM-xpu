@@ -23,14 +23,31 @@ class ModelRunner:
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
-        torch.cuda.set_device(rank)
+        self.device = resolve_device(config.get('device'), rank)
+        self.device_type = self.device.type
+        self.dist_backend = get_distributed_backend(
+            self.device,
+            self.world_size,
+            config.get('dist_backend'),
+        )
+        self.use_cuda_graphs = supports_cuda_graphs(self.device) and not self.enforce_eager
+
+        if self.device.type != "cpu":
+            set_device(self.device)
+
+        if self.world_size > 1:
+            dist.init_process_group(
+                self.dist_backend,
+                "tcp://localhost:12345",
+                world_size=config['world_size'],
+                rank=rank,
+            )
 
         # set model
         path_str = self.config['model_name_or_path']
-        model_name = Path(path_str).name
+        model_name = self.config.get('model_type') or Path(path_str).name
         match model_name:
-            case 'Qwen3-0.6B':
+            case 'Qwen3-0.6B' | 'qwen3-0.6b':
                 self.model = Qwen3ForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -48,7 +65,7 @@ class ModelRunner:
                     tie_word_embeddings=config['tie_word_embeddings'],
                     block_size=self.block_size,
                 )
-            case 'Llama-3.2-1B-Instruct':
+            case 'Llama-3.2-1B-Instruct' | 'llama-3.2-1b-instruct':
                 self.model = LlamaForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -69,7 +86,7 @@ class ModelRunner:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
         # Load weights in GPU (model moved to GPU before loading weights)
-        self.model = self.model.cuda(rank)
+        self.model = self.model.to(self.device)
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
@@ -92,10 +109,10 @@ class ModelRunner:
         # allocate kv cache
         self.allocate_kv_cache()
         # capture cuda graph for decoding
-        if not self.enforce_eager:
+        if self.use_cuda_graphs:
             self.capture_cudagraph()
 
-        torch.set_default_device(f'cuda:{rank}')
+        torch.set_default_device(str(self.device))
         torch.set_default_dtype(self.default_dtype)
 
         # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
@@ -148,10 +165,10 @@ class ModelRunner:
             self.shm.close()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if self.use_cuda_graphs:
             del self.graphs
             del self.graph_vars
-        torch.cuda.synchronize()
+        synchronize(self.device)
         # Check if process group exists before destroying
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -184,22 +201,23 @@ class ModelRunner:
     # run empty sequence to warm up the model
     # clear memory
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        empty_cache(self.device)
+        reset_peak_memory_stats(self.device)
         max_tokens = self.config['max_num_batch_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
         self.run(seqs, is_prefill=True)
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
 
     # allocate kv cache memory blocks for model
     def allocate_kv_cache(self):
         # find all available memory
-        free_mem, total_mem = torch.cuda.mem_get_info()
+        free_mem, total_mem = mem_get_info(self.device)
         total_free_mem = free_mem * self.config['gpu_memory_utilization']
-        peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
-        current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
+        stats = memory_stats(self.device)
+        peak_mem_usage = stats['allocated_bytes.all.peak']
+        current_mem_usage = stats['allocated_bytes.all.current']
         # reserve some room for peak memory usage during model execution
         available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
         
@@ -226,7 +244,7 @@ class ModelRunner:
             per_rank_max_blocks_tensor = torch.tensor(
                 num_available_kv_blocks,
                 dtype=torch.long,
-                device=f'cuda:{self.rank}'
+                device=self.device
             )
             # all_reduce with MIN: every rank learns the most conservative limit,
             # i.e. the block count that even the most memory-constrained rank can serve.
@@ -244,7 +262,15 @@ class ModelRunner:
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(
+            2,
+            self.config['num_layers'],
+            self.config['max_cached_blocks'],
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            device=self.device,
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -298,18 +324,18 @@ class ModelRunner:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
+        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
 
         set_context(
             is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True),
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_k),
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True) if block_tables else None,
         )
         return input_ids
 
@@ -329,22 +355,22 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
             cu_seqlens_k=None,
             max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True),
+            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True) if block_tables else None,
         )
         return input_ids    
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
-        return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
 
     # when prefilling, directly compute model forward + logits
     # when decoding, use cuda graph execution to speed up
@@ -352,7 +378,7 @@ class ModelRunner:
     # into graph_variable, and then replay the graph
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
-        if is_prefill or self.enforce_eager:
+        if is_prefill or not self.use_cuda_graphs:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
             hidden_states = self.model(input_ids)
@@ -404,20 +430,22 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
+        max_bs = self.config.get('max_num_seqs')
+        if max_bs is None:
+            max_bs = self.config.get('max_num_sequences', self.config['max_num_batch_tokens'])
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)
-        input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        input_ids = torch.zeros(max_bs, dtype=torch.long, device=self.device)
         # for paged attention
         # where to write new KV values in the cache
-        slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=self.device)
         # how many tokens each sequence has processed
-        context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        context_lens = torch.zeros(max_bs, dtype=torch.long, device=self.device)
         # where to read KV values in the cache
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=self.device)
         # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=self.device)
 
         # graphs to be captured for different batch sizes
         batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -446,7 +474,7 @@ class ModelRunner:
             self.graphs[batch_size] = graph
 
             # make sure that the capture is done before resetting and next capture
-            torch.cuda.synchronize()
+            synchronize(self.device)
             reset_context()
 
         self.graph_vars = dict(

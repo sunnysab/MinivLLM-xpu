@@ -5,13 +5,28 @@ import torch
 @dataclass
 class Context:
     is_prefill: bool = False
+    """Whether the current forward pass is the prefill phase."""
+
     cu_seqlens_q: torch.Tensor | None = None
+    """Cumulative sequence lengths for query, used by flash attention."""
+
     cu_seqlens_k: torch.Tensor | None = None
+    """Cumulative sequence lengths for key, used by flash attention."""
+
     max_seqlen_q: int = 0
+    """Maximum sequence length among queries in the batch."""
+
     max_seqlen_k: int = 0
+    """Maximum sequence length among keys in the batch."""
+
     slot_mapping: torch.Tensor | None = None
+    """Maps each token position to its KV cache slot index."""
+
     context_lens: torch.Tensor | None = None
+    """Length of the context (prompt + generated tokens) for each sequence."""
+
     block_tables: torch.Tensor | None = None
+    """Block tables for PagedAttention, mapping logical blocks to physical blocks."""
 
 _context = Context()
 

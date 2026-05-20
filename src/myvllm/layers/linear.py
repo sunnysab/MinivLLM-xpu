@@ -2,6 +2,8 @@ import torch.nn as nn
 import torch
 import torch.distributed as dist
 
+from myvllm.utils.device import get_tp_rank, get_tp_world_size, is_dist_initialized
+
 class LinearBase(nn.Module):
     """
     A base class for linear layers.
@@ -17,8 +19,8 @@ class LinearBase(nn.Module):
         super().__init__()
         # set tp_dim, tp_rank, tp_world_size for tensor parallelism
         self.tp_dim = tp_dim 
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_world_size()
         
         # create weight parameter with custom weight loader
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -87,7 +89,7 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
         super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
 
@@ -157,7 +159,7 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         num_kv_heads: int | None = None,
         bias: bool = False,
     ):
-        self.tp_size = dist.get_world_size()
+        self.tp_size = get_tp_world_size()
         num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
         self.num_heads = num_heads // self.tp_size
@@ -202,7 +204,7 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         assert input_size % tp_size == 0, "Input size must be divisible by tensor parallel size."
         super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
 
@@ -220,7 +222,7 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = nn.functional.linear(x, self.weight, self.bias)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and is_dist_initialized():
             dist.all_reduce(result, op=dist.ReduceOp.SUM)
         return result
 
